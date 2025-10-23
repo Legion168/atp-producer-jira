@@ -51,14 +51,20 @@ with cols[1]:
 timezone = "Europe/Rome"
 
 # Status mappings
-status_cols = st.columns(2)
+status_cols = st.columns(3)
 with status_cols[0]:
     in_progress_names_str = st.text_input("In Progress statuses (comma-separated)", value="In Development, Failed/Blocked, Analysis")
 with status_cols[1]:
     done_names_str = st.text_input("Done statuses (comma-separated)", value="Closed")
+with status_cols[2]:
+    exclude_statuses_str = st.text_input("Excluded statuses (comma-separated)", value="Acceptance, Feedback")
 
 in_progress_names = [s.strip() for s in in_progress_names_str.split(",") if s.strip()]
 done_names = [s.strip() for s in done_names_str.split(",") if s.strip()]
+exclude_statuses = [s.strip() for s in exclude_statuses_str.split(",") if s.strip()]
+
+# Subtask filtering option
+include_subtasks = st.checkbox("Include subtasks in ATP calculation", value=True, help="When unchecked, subtasks will be excluded from throughput and cycle time calculations")
 
 client: Optional[JiraClient] = None
 if base_url and email and api_token:
@@ -179,10 +185,24 @@ if compute:
         end_str = window.end.strftime(fmt)
 
         parts: List[str] = []
-        # Use status changed to Closed during for more reliable results
-        parts.append(f"status changed to Closed during (\"{start_str}\", \"{end_str}\")")
+        # Use status changed to user-defined done statuses during for more reliable results
+        if done_names:
+            # Create OR condition for multiple done statuses
+            done_status_conditions = []
+            for done_status in done_names:
+                done_status_conditions.append(f"status changed to \"{done_status}\" during (\"{start_str}\", \"{end_str}\")")
+            if len(done_status_conditions) == 1:
+                parts.append(done_status_conditions[0])
+            else:
+                parts.append(f"({' OR '.join(done_status_conditions)})")
+        else:
+            # Fallback to Closed if no done statuses specified
+            parts.append(f"status changed to Closed during (\"{start_str}\", \"{end_str}\")")
         if selected_account_id:
             parts.append(f"assignee = \"{selected_account_id}\"")
+        # Exclude subtasks if checkbox is unchecked
+        if not include_subtasks:
+            parts.append("issuetype != Sub-task")
 
         extra_jql = jql_and(*parts)
         full_jql = jql_wrap_filter(base_filter, extra_jql)
@@ -231,7 +251,7 @@ if compute:
 
         # Compute cycle times for this quarter
         with st.spinner(f"Computing cycle times for Q{quarter}..."):
-            cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id)
+            cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id, exclude_statuses=exclude_statuses)
         
         # Store quarter data
         quarters_data[quarter] = {
@@ -265,7 +285,7 @@ if compute:
         - **Percentiles**: Use P75/P90 for realistic planning and commitments
         - **Trends**: Compare quarters to identify improvements or issues
         
-        **Data Source**: Issues that changed status to 'Closed' during each quarter, with cycle time calculated from first 'In Progress' to first 'Done' transition.
+        **Data Source**: Issues that changed status to your specified 'Done' statuses during each quarter, with cycle time calculated from first 'In Progress' to first 'Done' transition.
         """)
     
     # Create comparison graph
@@ -483,68 +503,156 @@ if compute:
                                 st.metric("P90 (days)", f"{(summary.get('p90_days') or 0):.2f}")
                                 st.caption("90th percentile - 90% of issues complete within this time. Useful for worst-case planning.")
                         
-                        # Display table with explanation
+                        # Issue Type Breakdown Table
                         if valid_cycles:
-                            with st.expander("📋 Detailed Issue Table", expanded=False):
-                                st.markdown("""
-                                **Table Columns Explained:**
-                                - **#**: Sequential number for easy reference
-                                - **Issue**: Clickable Jira issue key (opens in new tab)
-                                - **In Progress At**: When the issue first moved to 'In Progress' status
-                                - **Done At**: When the issue first moved to 'Done' status
-                                - **Story Points**: Effort/complexity estimate for the issue
-                                - **Cycle Time (days)**: Total time from 'In Progress' to 'Done'
+                            # Group by issue type
+                            issue_type_data = {}
+                            for c in valid_cycles:
+                                # Get issue type from the original issues data
+                                issue_type = "Unknown"
+                                for issue in data['issues']:
+                                    if issue.get('key') == c.issue_key:
+                                        fields = issue.get('fields', {})
+                                        issue_type_info = fields.get('issuetype', {})
+                                        issue_type = issue_type_info.get('name', 'Unknown')
+                                        break
                                 
-                                **How to Use This Data:**
-                                - Click issue links to view details in Jira
-                                - Sort by cycle time to identify fastest/slowest issues
-                                - Look for patterns in story points vs cycle time
-                                - Use for retrospective analysis and process improvement
-                                """)
-                            
-                            rows = []
-                            for i, c in enumerate(valid_cycles, 1):
-                                # Create clickable link to the issue
-                                issue_url = f"{client.auth.base_url}/browse/{c.issue_key}"
+                                if issue_type not in issue_type_data:
+                                    issue_type_data[issue_type] = {'count': 0, 'story_points': 0, 'cycle_times': []}
                                 
-                                # Format dates to YYYY-MM-DD H:M:S
-                                in_progress_str = c.in_progress_at.strftime("%Y-%m-%d %H:%M:%S")
-                                done_str = c.done_at.strftime("%Y-%m-%d %H:%M:%S")
+                                issue_type_data[issue_type]['count'] += 1
                                 
-                                # Get story points for this issue
-                                story_points = issue_to_story_points.get(c.issue_key, "N/A")
+                                # Add story points
+                                story_points = issue_to_story_points.get(c.issue_key, 0)
+                                if isinstance(story_points, int):
+                                    issue_type_data[issue_type]['story_points'] += story_points
                                 
-                                rows.append({
-                                    "#": i,
-                                    "Issue": c.issue_key,
-                                    "Issue Link": issue_url,
-                                    "In Progress At": in_progress_str,
-                                    "Done At": done_str,
-                                    "Story Points": story_points,
-                                    "Cycle Time (days)": round((c.seconds or 0.0) / 86400.0, 2),
-                                })
+                                # Add cycle time
+                                if c.seconds:
+                                    cycle_days = c.seconds / 86400.0
+                                    issue_type_data[issue_type]['cycle_times'].append(cycle_days)
                             
-                            # Create HTML table
-                            html_table = "<table><tr>"
-                            # Headers
-                            for col in ["#", "Issue", "In Progress At", "Done At", "Story Points", "Cycle Time (days)"]:
-                                html_table += f"<th>{col}</th>"
-                            html_table += "</tr>"
-                            
-                            # Data rows
-                            for row in rows:
-                                html_table += "<tr>"
-                                html_table += f"<td>{row['#']}</td>"
-                                # Make issue key clickable
-                                html_table += f"<td><a href='{row['Issue Link']}' target='_blank'>{row['Issue']}</a></td>"
-                                html_table += f"<td>{row['In Progress At'] or 'N/A'}</td>"
-                                html_table += f"<td>{row['Done At'] or 'N/A'}</td>"
-                                html_table += f"<td>{row['Story Points']}</td>"
-                                html_table += f"<td>{row['Cycle Time (days)']}</td>"
-                                html_table += "</tr>"
-                            
-                            html_table += "</table>"
-                            st.markdown(html_table, unsafe_allow_html=True)
+                            # Create issue type breakdown table
+                            if issue_type_data:
+                                st.subheader("📊 Issue Type Breakdown")
+                                
+                                # Create two columns for side-by-side display
+                                col_left, col_right = st.columns([2, 1])
+                                
+                                with col_left:
+                                    # Detailed Issue Table
+                                    with st.expander("📋 Detailed Issue Table", expanded=False):
+                                        st.markdown("""
+                                        **Table Columns Explained:**
+                                        - **#**: Sequential number for easy reference
+                                        - **Issue**: Clickable Jira issue key (opens in new tab)
+                                        - **In Progress At**: When the issue first moved to 'In Progress' status
+                                        - **Done At**: When the issue first moved to 'Done' status
+                                        - **Story Points**: Effort/complexity estimate for the issue
+                                        - **Active Cycle Time**: Working days excluding Acceptance/Feedback time and impediment periods
+                                        - **Impediment Days**: Time flagged as blocked/impediment
+                                        
+                                        **How to Use This Data:**
+                                        - **Active Cycle Time**: Team performance metric (excludes waiting states and impediments)
+                                        - **Impediment Days**: Identifies blocking issues affecting delivery
+                                        - Compare Active Cycle Time with Impediment Days to understand productivity vs. blocking
+                                        """)
+                                        
+                                        rows = []
+                                        for i, c in enumerate(valid_cycles, 1):
+                                            # Create clickable link to the issue
+                                            issue_url = f"{client.auth.base_url}/browse/{c.issue_key}"
+                                            
+                                            # Format dates to YYYY-MM-DD H:M:S
+                                            in_progress_str = c.in_progress_at.strftime("%Y-%m-%d %H:%M:%S")
+                                            done_str = c.done_at.strftime("%Y-%m-%d %H:%M:%S")
+                                            
+                                            # Get story points for this issue
+                                            story_points = issue_to_story_points.get(c.issue_key, "N/A")
+                                            
+                                            # Calculate cycle time metrics
+                                            # Active Cycle Time = work time excluding waiting states
+                                            active_cycle_days = round((c.seconds or 0.0) / 86400.0, 2)
+                                            
+                                            # Impediment Days = time flagged as blocked
+                                            impediment_days = round((c.impediment_seconds or 0.0) / 86400.0, 2)
+                                            
+                                            rows.append({
+                                                "#": i,
+                                                "Issue": c.issue_key,
+                                                "Issue Link": issue_url,
+                                                "In Progress At": in_progress_str,
+                                                "Done At": done_str,
+                                                "Story Points": story_points,
+                                                "Active Cycle Time": active_cycle_days,
+                                                "Impediment Days": impediment_days,
+                                            })
+                                        
+                                        # Create HTML table
+                                        html_table = "<table><tr>"
+                                        # Headers
+                                        for col in ["#", "Issue", "In Progress At", "Done At", "Story Points", "Active Cycle Time", "Impediment Days"]:
+                                            html_table += f"<th>{col}</th>"
+                                        html_table += "</tr>"
+                                        
+                                        # Data rows
+                                        for row in rows:
+                                            html_table += "<tr>"
+                                            html_table += f"<td>{row['#']}</td>"
+                                            # Make issue key clickable
+                                            html_table += f"<td><a href='{row['Issue Link']}' target='_blank'>{row['Issue']}</a></td>"
+                                            html_table += f"<td>{row['In Progress At'] or 'N/A'}</td>"
+                                            html_table += f"<td>{row['Done At'] or 'N/A'}</td>"
+                                            html_table += f"<td>{row['Story Points']}</td>"
+                                            html_table += f"<td>{row['Active Cycle Time']}</td>"
+                                            html_table += f"<td>{row['Impediment Days']}</td>"
+                                            html_table += "</tr>"
+                                        
+                                        html_table += "</table>"
+                                        st.markdown(html_table, unsafe_allow_html=True)
+                                
+                                with col_right:
+                                    # Issue Type Breakdown Table
+                                    with st.expander("📊 Issue Type Summary", expanded=True):
+                                        st.markdown("""
+                                        **Issue Type Breakdown:**
+                                        - **Issue Type**: Type of work completed
+                                        - **Cards**: Number of issues completed
+                                        - **Story Points**: Total effort delivered
+                                        - **Avg Cycle Time**: Average days from 'In Progress' to 'Done'
+                                        """)
+                                        
+                                        # Create issue type breakdown table
+                                        breakdown_rows = []
+                                        for issue_type, data in sorted(issue_type_data.items()):
+                                            # Calculate average cycle time
+                                            avg_cycle_time = 0.0
+                                            if data['cycle_times']:
+                                                avg_cycle_time = sum(data['cycle_times']) / len(data['cycle_times'])
+                                            
+                                            breakdown_rows.append({
+                                                "Issue Type": issue_type,
+                                                "Cards": data['count'],
+                                                "Story Points": data['story_points'],
+                                                "Avg Cycle Time": f"{avg_cycle_time:.2f}"
+                                            })
+                                        
+                                        # Create HTML table for breakdown
+                                        breakdown_html = "<table><tr>"
+                                        for col in ["Issue Type", "Cards", "Story Points", "Avg Cycle Time"]:
+                                            breakdown_html += f"<th>{col}</th>"
+                                        breakdown_html += "</tr>"
+                                        
+                                        for row in breakdown_rows:
+                                            breakdown_html += "<tr>"
+                                            breakdown_html += f"<td>{row['Issue Type']}</td>"
+                                            breakdown_html += f"<td>{row['Cards']}</td>"
+                                            breakdown_html += f"<td>{row['Story Points']}</td>"
+                                            breakdown_html += f"<td>{row['Avg Cycle Time']}</td>"
+                                            breakdown_html += "</tr>"
+                                        
+                                        breakdown_html += "</table>"
+                                        st.markdown(breakdown_html, unsafe_allow_html=True)
                         
                         # Debug table for filtered issues
                         if filtered_cycles:

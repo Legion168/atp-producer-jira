@@ -47,8 +47,23 @@ As a Team Leader, you can use this tool to:
 - Issues with resolution "Won't Do" (unless set by the same person being analyzed)
 - Issues with incomplete status transition data
 - Issues without valid "In Progress" start dates
+- Subtasks (when "Include subtasks in ATP calculation" checkbox is unchecked)
 
 ### Cycle Time Calculation
+
+The application provides **two complementary cycle time metrics**:
+
+#### 1. Active Cycle Time (Team Performance)
+- **Definition**: Active work time excluding waiting states and impediment periods
+- **Excludes**: Time in Acceptance, Feedback, and impediment periods
+- **Use for**: Team velocity measurement, process improvement
+- **Formula**: `(total_seconds - excluded_seconds - impediment_seconds) / 86400` days
+
+#### 2. Impediment Time (Blocking Analysis)
+- **Definition**: Time spent flagged as "Impediment"
+- **Tracks**: "Flagged" field changes in Jira changelog
+- **Use for**: Identifying systemic bottlenecks, process optimization
+- **Formula**: `impediment_seconds / 86400` days
 
 #### Start of Work ("In Progress")
 The cycle time starts when an issue transitions to any of the configured "In Progress" statuses:
@@ -83,16 +98,25 @@ The cycle time ends when an issue is marked as completed:
 - If the **target assignee** sets resolution to "Won't Do", it still counts as their completion
 - This handles external cancellations vs. self-cancellations appropriately
 
-##### 6. Resolution Clearing
+##### 6. Subtask Filtering
+- **Default Behavior**: All issue types (including subtasks) are included in ATP calculations
+- **Filtering Option**: Use the "Include subtasks in ATP calculation" checkbox to exclude subtasks
+- **When Unchecked**: JQL queries automatically exclude issues with `issuetype = Sub-task`
+- **Use Cases**: 
+  - Exclude subtasks when you want to focus on main work items (stories, tasks, bugs)
+  - Include subtasks when you want comprehensive throughput metrics including granular work breakdown
+- **Impact**: Affects both throughput counts and cycle time calculations
+
+##### 7. Resolution Clearing
 - When resolution is cleared (set to "None"), this doesn't count as completion
 - Only non-empty, non-"None" resolutions are considered valid completions
 
-##### 7. Assignee Changes to "In Progress" Issues
+##### 8. Assignee Changes to "In Progress" Issues
 - When a person gets assigned to an issue that is already in "In Progress" status, the assignment time counts as the start of work
 - This handles scenarios where work is handed off or reassigned mid-process
 - Example: Issue is in "In Development" status, then person A gets assigned → assignment time becomes the "In Progress" start for person A
 
-##### 8. "In Progress" Date Overwrite Rules
+##### 9. "In Progress" Date Overwrite Rules
 - **Backlog Overwrite**: When a person moves an issue from "Backlog" to any "In Progress" status, this overwrites any previous "In Progress" date
 - **No Other Overwrites**: Transitions from other statuses (like "Feedback", "To Do", "Analysis") to "In Progress" do NOT overwrite the original date
 - **Purpose**: Ensures that only significant work starts (from Backlog) reset the cycle time, while minor status changes preserve the original work start
