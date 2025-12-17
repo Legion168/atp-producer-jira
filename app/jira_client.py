@@ -4,6 +4,7 @@ import logging
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -21,11 +22,12 @@ class JiraAuth:
 
 
 class JiraClient:
-    def __init__(self, base_url: str, email: str, api_token: str) -> None:
+    def __init__(self, base_url: str, email: str, api_token: str, request_delay: float = 0.1) -> None:
         if not base_url or not email or not api_token:
             raise ValueError("Missing Jira credentials or base URL")
         self.auth = JiraAuth(base_url=base_url.rstrip("/"), email=email, api_token=api_token)
         self._session = self._create_session()
+        self.request_delay = request_delay  # Delay between requests in seconds
 
     def _create_session(self) -> requests.Session:
         session = requests.Session()
@@ -203,7 +205,7 @@ class JiraClient:
             except Exception:
                 logging.info("Jira search request payload (repr): %r", payload)
 
-            resp = self._session.post(url_jql, json=payload)
+            resp = self._make_request_with_retry(lambda: self._session.post(url_jql, json=payload))
             try:
                 self._raise_for_status(resp)
             except requests.HTTPError:
@@ -231,7 +233,7 @@ class JiraClient:
         histories: List[Dict[str, Any]] = []
         while True:
             params = {"startAt": start_at, "maxResults": max_results}
-            resp = self._session.get(url, params=params)
+            resp = self._make_request_with_retry(lambda: self._session.get(url, params=params))
             self._raise_for_status(resp)
             data = resp.json()
             histories.extend(data.get("values", []))
@@ -239,8 +241,100 @@ class JiraClient:
             if len(histories) >= total:
                 break
             start_at += max_results
+            # Add delay between pagination requests
+            if self.request_delay > 0:
+                time.sleep(self.request_delay)
         return histories
 
+    def has_subtasks(self, issue_key: str) -> bool:
+        """
+        Check if an issue has subtasks.
+        
+        Args:
+            issue_key: The Jira issue key (e.g., "PROJ-123")
+            
+        Returns:
+            True if the issue has subtasks, False otherwise
+        """
+        # Search for subtasks of this issue
+        jql = f'parent = "{issue_key}"'
+        try:
+            result = self.search_issues(jql, fields=["key"], max_results=1)
+            return result.get("total", 0) > 0
+        except Exception as e:
+            logging.warning(f"Could not check subtasks for {issue_key}: {e}")
+            return False
+
+    def _make_request_with_retry(self, request_func, max_retries: int = 5, initial_delay: float = 1.0) -> requests.Response:
+        """
+        Make a request with exponential backoff retry for rate limiting (429 errors).
+        
+        Args:
+            request_func: A callable that returns a requests.Response
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay in seconds before first retry
+            
+        Returns:
+            requests.Response object
+            
+        Raises:
+            requests.HTTPError: If request fails after all retries
+        """
+        delay = initial_delay
+        
+        for attempt in range(max_retries + 1):
+            try:
+                resp = request_func()
+                
+                # If we get a 429, retry with exponential backoff
+                if resp.status_code == 429:
+                    if attempt < max_retries:
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                delay = float(retry_after)
+                            except ValueError:
+                                pass
+                        
+                        logging.warning(
+                            f"Rate limited (429). Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        time.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        # Last attempt failed
+                        resp.raise_for_status()
+                
+                # Add small delay between requests to avoid hitting rate limits
+                if self.request_delay > 0:
+                    time.sleep(self.request_delay)
+                
+                return resp
+                
+            except requests.HTTPError as e:
+                if e.response and e.response.status_code == 429:
+                    if attempt < max_retries:
+                        retry_after = e.response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                delay = float(retry_after)
+                            except ValueError:
+                                pass
+                        
+                        logging.warning(
+                            f"Rate limited (429). Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        time.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                        continue
+                
+                # For other errors or last attempt, raise immediately
+                raise
+        
+        # Should never reach here, but just in case
+        raise requests.HTTPError("Request failed after all retries")
+    
     @staticmethod
     def _raise_for_status(resp: requests.Response) -> None:
         try:

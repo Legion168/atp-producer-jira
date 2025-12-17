@@ -73,6 +73,15 @@ class ComplexCycleTimeStrategy(CycleTimeStrategy):
         Returns:
             CycleTime object
         """
+        # For QA, check for QA-specific start time
+        if self.is_qa and assignee_account_id:
+            qa_start_result = self._find_qa_start_time(histories, assignee_account_id)
+            if qa_start_result:
+                qa_start, start_status = qa_start_result
+                # Use QA start time instead of normal in-progress logic
+                assignee_periods = self._get_assignee_periods(histories, assignee_account_id)
+                return self._calculate_with_qa_start(histories, issue_key, qa_start, start_status, assignee_account_id, assignee_periods)
+        
         # Get assignee periods if filtering by assignee
         if assignee_account_id:
             assignee_periods = self._get_assignee_periods(histories, assignee_account_id)
@@ -729,4 +738,176 @@ class ComplexCycleTimeStrategy(CycleTimeStrategy):
                             return True
         
         return False
+    
+    def _find_qa_start_time(self, histories: List[Dict], assignee_account_id: Optional[str]) -> Optional[Tuple[dt.datetime, str]]:
+        """
+        Find when QA work started: when QA assigns themselves on 'Acceptance', 
+        assigns on 'in review' and moves to 'Acceptance', or moves ticket from 'Backlog' to any state.
+        
+        Args:
+            histories: List of history entries
+            assignee_account_id: The QA assignee account ID
+            
+        Returns:
+            Tuple of (datetime when QA work started, status at start) or None if not found
+        """
+        if not self.is_qa or not assignee_account_id:
+            return None
+        
+        acceptance_lower = "acceptance"
+        in_review_lower = "in review"
+        backlog_lower = "backlog"
+        
+        # Sort histories chronologically
+        sorted_histories = sorted(
+            histories,
+            key=lambda h: self._parse_jira_datetime(h.get("created")) or dt.datetime.min.replace(tzinfo=pytz.UTC)
+        )
+        
+        # Track the status and assignee at each point
+        current_status = None
+        current_assignee = None
+        qa_assigned_on_in_review = None  # Track when QA was assigned on 'in review'
+        
+        for history in sorted_histories:
+            created_at = self._parse_jira_datetime(history.get("created"))
+            if not created_at:
+                continue
+            
+            author = history.get("author", {})
+            author_account_id = author.get("accountId")
+            
+            # First, update status from status changes in this history entry
+            for item in history.get("items", []):
+                if item.get("field") == "status":
+                    from_string = (item.get("fromString") or "").strip().lower()
+                    to_string = (item.get("toString") or "").strip().lower()
+                    
+                    # Check if QA moves ticket from 'Backlog' to any state
+                    if from_string == backlog_lower and author_account_id == assignee_account_id:
+                        # QA moved ticket from Backlog to any state - ATP starts
+                        return (created_at, to_string)
+                    
+                    # Check if QA assigned themselves on 'in review' and then moved to 'Acceptance'
+                    if from_string == in_review_lower and to_string == acceptance_lower:
+                        if current_assignee == assignee_account_id and author_account_id == assignee_account_id:
+                            # QA was assigned on 'in review' and moved it to 'Acceptance'
+                            return (created_at, acceptance_lower)
+                        elif qa_assigned_on_in_review and author_account_id == assignee_account_id:
+                            # QA was assigned on 'in review' (tracked earlier) and now moves to 'Acceptance'
+                            return (created_at, acceptance_lower)
+                    
+                    # Check if QA was already assigned and status moved to Acceptance
+                    if to_string == acceptance_lower and current_assignee == assignee_account_id:
+                        if author_account_id == assignee_account_id:
+                            return (created_at, acceptance_lower)
+                    
+                    current_status = to_string
+            
+            # Then, process assignee changes (using the status we just updated)
+            for item in history.get("items", []):
+                if item.get("field") == "assignee":
+                    from_id = (item.get("from") or "").strip()
+                    to_id = (item.get("to") or "").strip()
+                    
+                    # Check if QA assigns themselves
+                    if to_id == assignee_account_id:
+                        current_assignee = assignee_account_id
+                        
+                        # If assigning on 'Acceptance', this is the start
+                        if current_status == acceptance_lower:
+                            return (created_at, acceptance_lower)
+                        
+                        # If assigning on 'in review', track it
+                        if current_status == in_review_lower:
+                            qa_assigned_on_in_review = created_at
+                    
+                    elif from_id == assignee_account_id:
+                        current_assignee = to_id if to_id else None
+                        qa_assigned_on_in_review = None  # Reset if unassigned
+        
+        return None
+    
+    def _find_qa_end_time(self, histories: List[Dict], qa_start: dt.datetime, start_status: str) -> Optional[dt.datetime]:
+        """
+        Find when QA work ended: when the ticket moves to a different status.
+        
+        Args:
+            histories: List of history entries
+            qa_start: When QA work started
+            start_status: The status at which QA started (e.g., "acceptance")
+            
+        Returns:
+            Datetime when ticket moved to a different status, or None if not found
+        """
+        start_status_lower = start_status.lower()
+        
+        # Sort histories chronologically
+        sorted_histories = sorted(
+            histories,
+            key=lambda h: self._parse_jira_datetime(h.get("created")) or dt.datetime.min.replace(tzinfo=pytz.UTC)
+        )
+        
+        for history in sorted_histories:
+            created_at = self._parse_jira_datetime(history.get("created"))
+            if not created_at or created_at <= qa_start:
+                continue
+            
+            for item in history.get("items", []):
+                if item.get("field") == "status":
+                    from_string = (item.get("fromString") or "").strip().lower()
+                    to_string = (item.get("toString") or "").strip().lower()
+                    
+                    # If moving away from the start status, this is the end
+                    if from_string == start_status_lower and to_string != start_status_lower:
+                        return created_at
+        
+        return None
+    
+    def _calculate_with_qa_start(self, histories: List[Dict], issue_key: str, qa_start: dt.datetime, start_status: str, assignee_account_id: str, assignee_periods: Optional[List[Tuple[dt.datetime, Optional[dt.datetime]]]]) -> CycleTime:
+        """
+        Calculate cycle time using QA-specific start time.
+        Stops when ticket moves to a different status.
+        
+        Args:
+            histories: List of history entries from Jira
+            issue_key: The issue key
+            qa_start: When QA work started (QA assigned themselves on Acceptance or moved from in review to Acceptance)
+            start_status: The status at which QA started (e.g., "acceptance")
+            assignee_account_id: The QA assignee account ID
+            assignee_periods: Optional list of assignee periods to filter by
+            
+        Returns:
+            CycleTime object
+        """
+        # Find when ticket moves to a different status
+        done_at = self._find_qa_end_time(histories, qa_start, start_status)
+        
+        if not done_at:
+            return CycleTime(
+                issue_key=issue_key,
+                in_progress_at=qa_start,
+                done_at=None,
+                seconds=None
+            )
+        
+        # Calculate cycle time in seconds, excluding time spent in excluded statuses
+        total_seconds = (done_at - qa_start).total_seconds()
+        excluded_seconds = self._calculate_excluded_time(histories, qa_start, done_at)
+        impediment_seconds = self._calculate_impediment_time(histories, qa_start, done_at)
+        
+        # Calculate overlap between excluded and impediment time to avoid double-counting
+        overlap_seconds = self._calculate_excluded_impediment_overlap(histories, qa_start, done_at)
+        
+        # Active time = total - excluded - impediment + overlap (to avoid double-counting)
+        seconds = total_seconds - excluded_seconds - impediment_seconds + overlap_seconds
+        
+        return CycleTime(
+            issue_key=issue_key,
+            in_progress_at=qa_start,
+            done_at=done_at,
+            seconds=seconds,
+            excluded_seconds=excluded_seconds,
+            impediment_seconds=impediment_seconds
+        )
 

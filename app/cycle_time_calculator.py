@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import List, Optional, Sequence
 from app.cycle_time_strategy import CycleTime, CycleTimeStrategy
 from app.simple_cycle_time_strategy import SimpleCycleTimeStrategy
@@ -19,7 +20,7 @@ class CycleTimeCalculator:
     more maintainable and testable.
     """
     
-    def __init__(self, in_progress_names: Sequence[str], done_names: Sequence[str], exclude_statuses: Sequence[str] = ("Acceptance",)):
+    def __init__(self, in_progress_names: Sequence[str], done_names: Sequence[str], exclude_statuses: Sequence[str] = ("Acceptance",), is_qa: bool = False):
         """
         Initialize the calculator with status names.
         
@@ -27,21 +28,26 @@ class CycleTimeCalculator:
             in_progress_names: List of status names that indicate work has started
             done_names: List of status names that indicate work is completed
             exclude_statuses: List of status names to exclude from cycle time (e.g., "Acceptance")
+            is_qa: If True, use QA-specific logic: ATP starts when QA assigns themselves
+                   on 'Acceptance' or assigns on 'in review' and moves to 'Acceptance'
         """
         self.in_progress_names = list(in_progress_names)
         self.done_names = list(done_names)
         self.exclude_statuses = list(exclude_statuses)
+        self.is_qa = is_qa
         
         # Pre-create strategy instances
         self.simple_strategy = SimpleCycleTimeStrategy(
             self.in_progress_names,
             self.done_names,
-            self.exclude_statuses
+            self.exclude_statuses,
+            is_qa=is_qa
         )
         self.complex_strategy = ComplexCycleTimeStrategy(
             self.in_progress_names,
             self.done_names,
-            self.exclude_statuses
+            self.exclude_statuses,
+            is_qa=is_qa
         )
     
     def calculate_cycle_times(self, client, issue_keys: List[str], assignee_account_id: Optional[str] = None) -> List[CycleTime]:
@@ -61,7 +67,7 @@ class CycleTimeCalculator:
         """
         results = []
         
-        for issue_key in issue_keys:
+        for i, issue_key in enumerate(issue_keys):
             try:
                 histories = client.get_issue_changelog(issue_key)
                 
@@ -80,6 +86,11 @@ class CycleTimeCalculator:
                     done_at=None,
                     seconds=None
                 ))
+            
+            # Add a small delay between issues to avoid rate limiting
+            # Skip delay for the last issue
+            if i < len(issue_keys) - 1:
+                time.sleep(0.1)  # 100ms delay between issues
         
         return results
     

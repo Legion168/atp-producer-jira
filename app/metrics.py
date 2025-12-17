@@ -80,13 +80,18 @@ def extract_cycle_times(
     done_names: Sequence[str] = ("Done",),
     assignee_account_id: Optional[str] = None,
     exclude_statuses: Sequence[str] = ("Acceptance", "Feedback"),
+    is_qa: bool = False,
 ) -> List[CycleTime]:
     """
     Calculate cycle times using the new CycleTimeCalculator class.
     
     This is a clean wrapper around the new class-based implementation.
+    
+    Args:
+        is_qa: If True, use QA-specific logic: ATP starts when QA assigns themselves
+               on 'Acceptance' or assigns on 'in review' and moves to 'Acceptance'
     """
-    calculator = CycleTimeCalculator(in_progress_names, done_names, exclude_statuses)
+    calculator = CycleTimeCalculator(in_progress_names, done_names, exclude_statuses, is_qa=is_qa)
     return calculator.calculate_cycle_times(client, list(issue_keys), assignee_account_id)
 
 

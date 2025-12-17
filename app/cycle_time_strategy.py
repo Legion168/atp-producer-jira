@@ -20,7 +20,7 @@ class CycleTime:
 class CycleTimeStrategy(ABC):
     """Abstract base class for cycle time calculation strategies."""
     
-    def __init__(self, in_progress_names: List[str], done_names: List[str], exclude_statuses: List[str]):
+    def __init__(self, in_progress_names: List[str], done_names: List[str], exclude_statuses: List[str], is_qa: bool = False):
         """
         Initialize the strategy with status names.
         
@@ -28,10 +28,13 @@ class CycleTimeStrategy(ABC):
             in_progress_names: List of status names that indicate work has started
             done_names: List of status names that indicate work is completed
             exclude_statuses: List of status names to exclude from cycle time
+            is_qa: If True, use QA-specific logic: ATP starts when QA assigns themselves
+                   on 'Acceptance' or assigns on 'in review' and moves to 'Acceptance'
         """
         self.in_progress_lower = {name.lower() for name in in_progress_names}
         self.done_lower = {name.lower() for name in done_names}
         self.exclude_lower = {name.lower() for name in exclude_statuses}
+        self.is_qa = is_qa
     
     @abstractmethod
     def calculate(self, histories: List[Dict], issue_key: str, assignee_account_id: Optional[str] = None) -> CycleTime:

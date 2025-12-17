@@ -66,6 +66,9 @@ exclude_statuses = [s.strip() for s in exclude_statuses_str.split(",") if s.stri
 # Subtask filtering option
 include_subtasks = st.checkbox("Include subtasks in ATP calculation", value=True, help="When unchecked, subtasks will be excluded from throughput and cycle time calculations")
 
+# QA mode option
+is_qa = st.checkbox("This person is a QA", value=False, help="When checked, ATP calculation starts when QA assigns themselves on 'Acceptance' or assigns on 'in review' and moves to 'Acceptance'")
+
 client: Optional[JiraClient] = None
 if base_url and email and api_token:
     try:
@@ -213,7 +216,7 @@ if compute:
         # Search issues for this quarter
         with st.spinner(f"Searching issues for Q{quarter}..."):
             try:
-                search = client.search_issues(full_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120"])  # noqa: E501
+                search = client.search_issues(full_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
             except Exception as e:
                 if "410" in str(e) and project_keys_for_board:
                     st.warning(f"Q{quarter}: Board filter caused a 410; retrying with project-only filter.")
@@ -221,7 +224,7 @@ if compute:
                     proj_clause = " OR ".join([f"project = {k}" for k in project_keys_for_board])
                     fallback_jql = jql_and(f"({proj_clause})", extra_jql)
                     try:
-                        search = client.search_issues(fallback_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120"])  # noqa: E501
+                        search = client.search_issues(fallback_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
                     except Exception as e2:
                         st.error(f"Q{quarter}: Issue search failed after fallback: {e2}")
                         continue
@@ -230,6 +233,36 @@ if compute:
                     continue
 
         issues = search.get("issues", [])
+        
+        # Filter out feature tickets with tasks when assignee is selected
+        if selected_account_id:
+            filtered_issues = []
+            for issue in issues:
+                fields = issue.get("fields", {})
+                issue_type_info = fields.get("issuetype", {})
+                issue_type_name = issue_type_info.get("name", "").lower()
+                
+                # Check if it's a feature ticket
+                is_feature = "feature" in issue_type_name
+                
+                if is_feature:
+                    # Check if this feature has subtasks
+                    # First try to get from the subtasks field (more efficient)
+                    subtasks = fields.get("subtasks")
+                    has_tasks = len(subtasks) > 0 if subtasks else False
+                    
+                    # If subtasks field is not available or empty, check via API
+                    if not has_tasks and subtasks is None:
+                        issue_key = issue.get("key")
+                        has_tasks = client.has_subtasks(issue_key)
+                    
+                    # Exclude features with tasks from person ATP
+                    if has_tasks:
+                        continue  # Skip this issue
+                
+                filtered_issues.append(issue)
+            issues = filtered_issues
+        
         issue_keys = [it.get("key") for it in issues]
         
         # Create mapping from issue key to story points
@@ -251,7 +284,7 @@ if compute:
 
         # Compute cycle times for this quarter
         with st.spinner(f"Computing cycle times for Q{quarter}..."):
-            cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id, exclude_statuses=exclude_statuses)
+            cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id, exclude_statuses=exclude_statuses, is_qa=is_qa)
         
         # Store quarter data
         quarters_data[quarter] = {
