@@ -14,6 +14,9 @@ from app.jira_client import JiraClient
 from app.metrics import (
     TimeWindow,
     compute_quarter_range,
+    compute_relative_period,
+    compute_custom_period,
+    split_period_into_months,
     extract_cycle_times,
     jql_and,
     jql_wrap_filter,
@@ -27,6 +30,10 @@ st.title("ATP Producer: Jira Throughput & Cycle Time")
 # Initialize session state
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
+if 'comparison_mode' not in st.session_state:
+    st.session_state.comparison_mode = "quarterly"
+if 'comparison_periods' not in st.session_state:
+    st.session_state.comparison_periods = []
 
 # ------------------- Sidebar: Credentials -------------------
 with st.sidebar:
@@ -41,9 +48,22 @@ with st.sidebar:
 
 # ------------------- Inputs -------------------
 st.subheader("Inputs")
+
+# Mode selector
+comparison_mode = st.radio(
+    "View Mode",
+    options=["Quarterly View", "Period Comparison"],
+    index=0 if st.session_state.comparison_mode == "quarterly" else 1,
+    key="mode_selector"
+)
+st.session_state.comparison_mode = "quarterly" if comparison_mode == "Quarterly View" else "comparison"
+
 cols = st.columns(2)
 with cols[0]:
-    year = st.number_input("Year", min_value=2000, max_value=2100, value=pd.Timestamp.now().year)
+    if st.session_state.comparison_mode == "quarterly":
+        year = st.number_input("Year", min_value=2000, max_value=2100, value=pd.Timestamp.now().year)
+    else:
+        st.write("")  # Placeholder for alignment
 with cols[1]:
     st.write("")
 
@@ -68,6 +88,82 @@ include_subtasks = st.checkbox("Include subtasks in ATP calculation", value=True
 
 # QA mode option
 is_qa = st.checkbox("This person is a QA", value=False, help="When checked, ATP calculation starts when QA assigns themselves on 'Acceptance' or assigns on 'in review' and moves to 'Acceptance'")
+
+# Period Comparison UI
+if st.session_state.comparison_mode == "comparison":
+    st.divider()
+    st.subheader("Period Selection")
+    
+    period_type = st.radio(
+        "Period Type",
+        options=["Relative Period", "Custom Date Range"],
+        key="period_type_selector"
+    )
+    
+    if period_type == "Relative Period":
+        col_rel1, col_rel2 = st.columns([3, 1])
+        with col_rel1:
+            months = st.number_input("Last N months", min_value=1, max_value=120, value=3, key="relative_months")
+        with col_rel2:
+            st.write("")
+            add_relative = st.button("Add Period", key="add_relative")
+        
+        if add_relative:
+            try:
+                window = compute_relative_period(months, tz=timezone)
+                label = f"Last {months} month{'s' if months != 1 else ''}"
+                period_entry = {"label": label, "window": window}
+                if period_entry not in st.session_state.comparison_periods:
+                    st.session_state.comparison_periods.append(period_entry)
+                    st.success(f"Added: {label}")
+                else:
+                    st.warning(f"Period '{label}' already added")
+            except Exception as e:
+                st.error(f"Failed to add period: {e}")
+    
+    else:  # Custom Date Range
+        col_cust1, col_cust2, col_cust3 = st.columns([2, 2, 1])
+        with col_cust1:
+            start_date = st.date_input("Start Date", value=pd.Timestamp.now().date() - pd.Timedelta(days=90), key="custom_start")
+        with col_cust2:
+            end_date = st.date_input("End Date", value=pd.Timestamp.now().date(), key="custom_end")
+        with col_cust3:
+            st.write("")
+            add_custom = st.button("Add Period", key="add_custom")
+        
+        if add_custom:
+            try:
+                window = compute_custom_period(start_date, end_date, tz=timezone)
+                # Format label nicely
+                start_str = start_date.strftime("%b %d, %Y")
+                end_str = end_date.strftime("%b %d, %Y")
+                label = f"{start_str} - {end_str}"
+                period_entry = {"label": label, "window": window}
+                if period_entry not in st.session_state.comparison_periods:
+                    st.session_state.comparison_periods.append(period_entry)
+                    st.success(f"Added: {label}")
+                else:
+                    st.warning(f"Period '{label}' already added")
+            except ValueError as e:
+                st.error(f"Invalid date range: {e}")
+            except Exception as e:
+                st.error(f"Failed to add period: {e}")
+    
+    # Display selected periods with remove buttons
+    if st.session_state.comparison_periods:
+        st.write("**Selected Periods:**")
+        for idx, period in enumerate(st.session_state.comparison_periods):
+            col_period, col_remove = st.columns([4, 1])
+            with col_period:
+                st.write(f"{idx + 1}. {period['label']}")
+            with col_remove:
+                if st.button("Remove", key=f"remove_{idx}"):
+                    st.session_state.comparison_periods.pop(idx)
+                    st.rerun()
+        
+        if st.button("Clear All Periods", key="clear_all_periods"):
+            st.session_state.comparison_periods = []
+            st.rerun()
 
 client: Optional[JiraClient] = None
 if base_url and email and api_token:
@@ -160,6 +256,140 @@ if client and st.session_state.get("boards"):
                     selected_account_id = label_to_id.get(choice)
         st.session_state["selected_account_id"] = selected_account_id
 
+
+def process_period(
+    client: JiraClient,
+    base_filter: str,
+    window: TimeWindow,
+    period_label: str,
+    done_names: List[str],
+    selected_account_id: Optional[str],
+    include_subtasks: bool,
+    in_progress_names: List[str],
+    exclude_statuses: List[str],
+    is_qa: bool,
+    project_keys_for_board: List[str],
+    timezone: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Process a single time period and return metrics data.
+    
+    Returns:
+        Dictionary with period data or None if processing failed
+    """
+    fmt = "%Y/%m/%d %H:%M"
+    start_str = window.start.strftime(fmt)
+    end_str = window.end.strftime(fmt)
+    
+    parts: List[str] = []
+    # Use status changed to user-defined done statuses during for more reliable results
+    if done_names:
+        # Create OR condition for multiple done statuses
+        done_status_conditions = []
+        for done_status in done_names:
+            done_status_conditions.append(f"status changed to \"{done_status}\" during (\"{start_str}\", \"{end_str}\")")
+        if len(done_status_conditions) == 1:
+            parts.append(done_status_conditions[0])
+        else:
+            parts.append(f"({' OR '.join(done_status_conditions)})")
+    else:
+        # Fallback to Closed if no done statuses specified
+        parts.append(f"status changed to Closed during (\"{start_str}\", \"{end_str}\")")
+    if selected_account_id:
+        parts.append(f"assignee = \"{selected_account_id}\"")
+    # Exclude subtasks if checkbox is unchecked
+    if not include_subtasks:
+        parts.append("issuetype != Sub-task")
+    
+    extra_jql = jql_and(*parts)
+    full_jql = jql_wrap_filter(base_filter, extra_jql)
+    
+    with st.expander(f"{period_label} JQL used", expanded=False):
+        st.code(full_jql)
+    
+    # Search issues for this period
+    with st.spinner(f"Searching issues for {period_label}..."):
+        try:
+            search = client.search_issues(full_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
+        except Exception as e:
+            if "410" in str(e) and project_keys_for_board:
+                st.warning(f"{period_label}: Board filter caused a 410; retrying with project-only filter.")
+                # Use an OR of projects if multiple
+                proj_clause = " OR ".join([f"project = {k}" for k in project_keys_for_board])
+                fallback_jql = jql_and(f"({proj_clause})", extra_jql)
+                try:
+                    search = client.search_issues(fallback_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
+                except Exception as e2:
+                    st.error(f"{period_label}: Issue search failed after fallback: {e2}")
+                    return None
+            else:
+                st.error(f"{period_label}: Issue search failed: {e}")
+                return None
+    
+    issues = search.get("issues", [])
+    
+    # Filter out feature tickets with tasks when assignee is selected
+    if selected_account_id:
+        filtered_issues = []
+        for issue in issues:
+            fields = issue.get("fields", {})
+            issue_type_info = fields.get("issuetype", {})
+            issue_type_name = issue_type_info.get("name", "").lower()
+            
+            # Check if it's a feature ticket
+            is_feature = "feature" in issue_type_name
+            
+            if is_feature:
+                # Check if this feature has subtasks
+                # First try to get from the subtasks field (more efficient)
+                subtasks = fields.get("subtasks")
+                has_tasks = len(subtasks) > 0 if subtasks else False
+                
+                # If subtasks field is not available or empty, check via API
+                if not has_tasks and subtasks is None:
+                    issue_key = issue.get("key")
+                    has_tasks = client.has_subtasks(issue_key)
+                
+                # Exclude features with tasks from person ATP
+                if has_tasks:
+                    continue  # Skip this issue
+            
+            filtered_issues.append(issue)
+        issues = filtered_issues
+    
+    issue_keys = [it.get("key") for it in issues]
+    
+    # Create mapping from issue key to story points
+    issue_to_story_points = {}
+    for issue in issues:
+        issue_key = issue.get("key")
+        fields = issue.get("fields", {})
+        
+        # Use the correct story points field ID for this Jira instance
+        story_points_raw = fields.get("customfield_10120")
+        
+        # Convert to integer if it's a number, otherwise keep as is
+        if story_points_raw is not None and isinstance(story_points_raw, (int, float)):
+            story_points = int(story_points_raw)
+        else:
+            story_points = story_points_raw
+        
+        issue_to_story_points[issue_key] = story_points
+    
+    # Compute cycle times for this period
+    with st.spinner(f"Computing cycle times for {period_label}..."):
+        cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id, exclude_statuses=exclude_statuses, is_qa=is_qa)
+    
+    return {
+        'issues': issues,
+        'issue_keys': issue_keys,
+        'issue_to_story_points': issue_to_story_points,
+        'cycles': cycles,
+        'window': window,
+        'label': period_label
+    }
+
+
 compute = st.button("Compute Metrics", type="primary")
 
 if compute:
@@ -169,6 +399,12 @@ if compute:
     if not selected_board_id:
         st.error("Please select a board from the dropdown.")
         st.stop()
+    
+    # Validate comparison mode requirements
+    if st.session_state.comparison_mode == "comparison":
+        if not st.session_state.comparison_periods:
+            st.error("Please add at least one period for comparison.")
+            st.stop()
 
     # Base filter from board
     try:
@@ -177,126 +413,61 @@ if compute:
         st.error(f"Failed to read board filter: {e}")
         st.stop()
 
-    # Process all quarters for the selected year
-    quarters_data = {}
-    fmt = "%Y/%m/%d %H:%M"
+    # Process periods based on mode
+    periods_data = {}
     
-    for quarter in range(1, 5):
-        # Time window for this quarter
-        window: TimeWindow = compute_quarter_range(int(year), quarter, tz=timezone)
-        start_str = window.start.strftime(fmt)
-        end_str = window.end.strftime(fmt)
-
-        parts: List[str] = []
-        # Use status changed to user-defined done statuses during for more reliable results
-        if done_names:
-            # Create OR condition for multiple done statuses
-            done_status_conditions = []
-            for done_status in done_names:
-                done_status_conditions.append(f"status changed to \"{done_status}\" during (\"{start_str}\", \"{end_str}\")")
-            if len(done_status_conditions) == 1:
-                parts.append(done_status_conditions[0])
-            else:
-                parts.append(f"({' OR '.join(done_status_conditions)})")
-        else:
-            # Fallback to Closed if no done statuses specified
-            parts.append(f"status changed to Closed during (\"{start_str}\", \"{end_str}\")")
-        if selected_account_id:
-            parts.append(f"assignee = \"{selected_account_id}\"")
-        # Exclude subtasks if checkbox is unchecked
-        if not include_subtasks:
-            parts.append("issuetype != Sub-task")
-
-        extra_jql = jql_and(*parts)
-        full_jql = jql_wrap_filter(base_filter, extra_jql)
-
-        with st.expander(f"Q{quarter} JQL used", expanded=False):
-            st.code(full_jql)
-
-        # Search issues for this quarter
-        with st.spinner(f"Searching issues for Q{quarter}..."):
-            try:
-                search = client.search_issues(full_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
-            except Exception as e:
-                if "410" in str(e) and project_keys_for_board:
-                    st.warning(f"Q{quarter}: Board filter caused a 410; retrying with project-only filter.")
-                    # Use an OR of projects if multiple
-                    proj_clause = " OR ".join([f"project = {k}" for k in project_keys_for_board])
-                    fallback_jql = jql_and(f"({proj_clause})", extra_jql)
-                    try:
-                        search = client.search_issues(fallback_jql, fields=["key", "summary", "issuetype", "status", "updated", "customfield_10120", "subtasks"])  # noqa: E501
-                    except Exception as e2:
-                        st.error(f"Q{quarter}: Issue search failed after fallback: {e2}")
-                        continue
-                else:
-                    st.error(f"Q{quarter}: Issue search failed: {e}")
-                    continue
-
-        issues = search.get("issues", [])
-        
-        # Filter out feature tickets with tasks when assignee is selected
-        if selected_account_id:
-            filtered_issues = []
-            for issue in issues:
-                fields = issue.get("fields", {})
-                issue_type_info = fields.get("issuetype", {})
-                issue_type_name = issue_type_info.get("name", "").lower()
-                
-                # Check if it's a feature ticket
-                is_feature = "feature" in issue_type_name
-                
-                if is_feature:
-                    # Check if this feature has subtasks
-                    # First try to get from the subtasks field (more efficient)
-                    subtasks = fields.get("subtasks")
-                    has_tasks = len(subtasks) > 0 if subtasks else False
-                    
-                    # If subtasks field is not available or empty, check via API
-                    if not has_tasks and subtasks is None:
-                        issue_key = issue.get("key")
-                        has_tasks = client.has_subtasks(issue_key)
-                    
-                    # Exclude features with tasks from person ATP
-                    if has_tasks:
-                        continue  # Skip this issue
-                
-                filtered_issues.append(issue)
-            issues = filtered_issues
-        
-        issue_keys = [it.get("key") for it in issues]
-        
-        # Create mapping from issue key to story points
-        issue_to_story_points = {}
-        for issue in issues:
-            issue_key = issue.get("key")
-            fields = issue.get("fields", {})
+    if st.session_state.comparison_mode == "quarterly":
+        # Process all quarters for the selected year
+        for quarter in range(1, 5):
+            window: TimeWindow = compute_quarter_range(int(year), quarter, tz=timezone)
+            period_label = f"Q{quarter}"
             
-            # Use the correct story points field ID for this Jira instance
-            story_points_raw = fields.get("customfield_10120")
+            data = process_period(
+                client=client,
+                base_filter=base_filter,
+                window=window,
+                period_label=period_label,
+                done_names=done_names,
+                selected_account_id=selected_account_id,
+                include_subtasks=include_subtasks,
+                in_progress_names=in_progress_names,
+                exclude_statuses=exclude_statuses,
+                is_qa=is_qa,
+                project_keys_for_board=project_keys_for_board,
+                timezone=timezone
+            )
             
-            # Convert to integer if it's a number, otherwise keep as is
-            if story_points_raw is not None and isinstance(story_points_raw, (int, float)):
-                story_points = int(story_points_raw)
-            else:
-                story_points = story_points_raw
+            if data:
+                periods_data[quarter] = data
+    else:
+        # Process comparison periods
+        for idx, period_entry in enumerate(st.session_state.comparison_periods):
+            window = period_entry["window"]
+            period_label = period_entry["label"]
             
-            issue_to_story_points[issue_key] = story_points
+            data = process_period(
+                client=client,
+                base_filter=base_filter,
+                window=window,
+                period_label=period_label,
+                done_names=done_names,
+                selected_account_id=selected_account_id,
+                include_subtasks=include_subtasks,
+                in_progress_names=in_progress_names,
+                exclude_statuses=exclude_statuses,
+                is_qa=is_qa,
+                project_keys_for_board=project_keys_for_board,
+                timezone=timezone
+            )
+            
+            if data:
+                periods_data[idx] = data
 
-        # Compute cycle times for this quarter
-        with st.spinner(f"Computing cycle times for Q{quarter}..."):
-            cycles = extract_cycle_times(client, issue_keys, in_progress_names=in_progress_names, done_names=done_names, assignee_account_id=selected_account_id, exclude_statuses=exclude_statuses, is_qa=is_qa)
-        
-        # Store quarter data
-        quarters_data[quarter] = {
-            'issues': issues,
-            'issue_keys': issue_keys,
-            'issue_to_story_points': issue_to_story_points,
-            'cycles': cycles,
-            'window': window
-        }
-
-    # Display quarterly statistics
-    st.subheader(f"Year {year} - Quarterly Cycle Time Statistics")
+    # Display statistics
+    if st.session_state.comparison_mode == "quarterly":
+        st.subheader(f"Year {year} - Quarterly Cycle Time Statistics")
+    else:
+        st.subheader("Period Comparison - Cycle Time Statistics")
     
     # Add general explanation
     with st.expander("📚 Understanding These Metrics", expanded=False):
@@ -322,14 +493,47 @@ if compute:
         """)
     
     # Create comparison graph
-    if quarters_data:
+    if periods_data:
         # Prepare data for comparison graph
         comparison_data = []
-        for quarter in range(1, 5):
-            if quarter in quarters_data:
-                data = quarters_data[quarter]
+        
+        if st.session_state.comparison_mode == "quarterly":
+            # Process quarters in order
+            for quarter in range(1, 5):
+                if quarter in periods_data:
+                    data = periods_data[quarter]
+                    cycles = data['cycles']
+                    issue_to_story_points = data['issue_to_story_points']
+                    
+                    # Filter valid cycles
+                    valid_cycles = [c for c in cycles if c.in_progress_at is not None and c.done_at is not None]
+                    seconds_list = [c.seconds for c in valid_cycles if c.seconds is not None]
+                    story_points_list = []
+                    for c in valid_cycles:
+                        story_points = issue_to_story_points.get(c.issue_key, "N/A")
+                        if isinstance(story_points, int):
+                            story_points_list.append(story_points)
+                    
+                    if seconds_list:
+                        summary = summarize_cycle_times(seconds_list)
+                        total_story_points = sum(story_points_list) if story_points_list else 0
+                        
+                        comparison_data.append({
+                            'Period': f'Q{quarter}',
+                            'Count': summary.get("count", 0),
+                            'Total Story Points': total_story_points,
+                            'Avg Cycle Time (days)': round(summary.get('avg_days', 0), 2),
+                            'Median Cycle Time (days)': round(summary.get('median_days', 0), 2),
+                            'P75 Cycle Time (days)': round(summary.get('p75_days', 0), 2),
+                            'P90 Cycle Time (days)': round(summary.get('p90_days', 0), 2)
+                        })
+        else:
+            # Process comparison periods in order
+            for idx in sorted(periods_data.keys()):
+                data = periods_data[idx]
                 cycles = data['cycles']
                 issue_to_story_points = data['issue_to_story_points']
+                period_label = data['label']
                 
                 # Filter valid cycles
                 valid_cycles = [c for c in cycles if c.in_progress_at is not None and c.done_at is not None]
@@ -345,7 +549,7 @@ if compute:
                     total_story_points = sum(story_points_list) if story_points_list else 0
                     
                     comparison_data.append({
-                        'Quarter': f'Q{quarter}',
+                        'Period': period_label,
                         'Count': summary.get("count", 0),
                         'Total Story Points': total_story_points,
                         'Avg Cycle Time (days)': round(summary.get('avg_days', 0), 2),
@@ -356,7 +560,20 @@ if compute:
         
         if comparison_data:
             # Create comparison charts with explanations
-            st.subheader("📊 Quarterly Performance Comparison")
+            if st.session_state.comparison_mode == "quarterly":
+                st.subheader("📊 Quarterly Performance Comparison")
+                period_label = "Quarter"
+                chart_title_count = "Issues Completed & Story Points by Quarter"
+                chart_title_cycle = "Cycle Time Metrics by Quarter"
+                summary_title = "📊 Quarterly Summary"
+                explanation_text = "quarter"
+            else:
+                st.subheader("📊 Period Performance Comparison")
+                period_label = "Period"
+                chart_title_count = "Issues Completed & Story Points by Period"
+                chart_title_cycle = "Cycle Time Metrics by Period"
+                summary_title = "📊 Period Summary"
+                explanation_text = "period"
             
             col1, col2 = st.columns(2)
             
@@ -366,21 +583,21 @@ if compute:
                 
                 fig_count = go.Figure()
                 fig_count.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['Count'],
                     name='Count',
                     marker_color='lightblue'
                 ))
                 fig_count.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['Total Story Points'],
                     name='Total Story Points',
                     marker_color='lightgreen'
                 ))
                 
                 fig_count.update_layout(
-                    title='Issues Completed & Story Points by Quarter',
-                    xaxis_title='Quarter',
+                    title=chart_title_count,
+                    xaxis_title=period_label,
                     yaxis_title='Count / Story Points',
                     barmode='group',
                     height=400
@@ -388,45 +605,45 @@ if compute:
                 st.plotly_chart(fig_count, use_container_width=True)
                 
                 with st.expander("📈 Throughput Explanation", expanded=False):
-                    st.markdown("""
+                    st.markdown(f"""
                     **Throughput Metrics:**
-                    - **Count**: Number of issues completed each quarter
-                    - **Story Points**: Total effort delivered each quarter
+                    - **Count**: Number of issues completed each {explanation_text}
+                    - **Story Points**: Total effort delivered each {explanation_text}
                     
-                    *Higher values indicate better throughput. Compare quarters to identify trends in team productivity.*
+                    *Higher values indicate better throughput. Compare {explanation_text}s to identify trends in team productivity.*
                     """)
             
             with col2:
                 # Cycle Time metrics comparison
                 fig_cycle = go.Figure()
                 fig_cycle.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['Avg Cycle Time (days)'],
                     name='Avg',
                     marker_color='orange'
                 ))
                 fig_cycle.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['Median Cycle Time (days)'],
                     name='Median',
                     marker_color='red'
                 ))
                 fig_cycle.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['P75 Cycle Time (days)'],
                     name='P75',
                     marker_color='purple'
                 ))
                 fig_cycle.add_trace(go.Bar(
-                    x=df_comparison['Quarter'],
+                    x=df_comparison['Period'],
                     y=df_comparison['P90 Cycle Time (days)'],
                     name='P90',
                     marker_color='brown'
                 ))
                 
                 fig_cycle.update_layout(
-                    title='Cycle Time Metrics by Quarter',
-                    xaxis_title='Quarter',
+                    title=chart_title_cycle,
+                    xaxis_title=period_label,
                     yaxis_title='Days',
                     barmode='group',
                     height=400
@@ -445,35 +662,51 @@ if compute:
                     """)
             
             # Summary table
-            st.subheader("📊 Quarterly Summary")
+            st.subheader(summary_title)
             st.dataframe(df_comparison, use_container_width=True)
             
             with st.expander("📋 Summary Table Explanation", expanded=False):
-                st.markdown("""
+                if st.session_state.comparison_mode == "quarterly":
+                    period_explanation = "**Quarter**: Q1, Q2, Q3, Q4 of the selected year"
+                    compare_text = "quarters"
+                else:
+                    period_explanation = "**Period**: The time period label (e.g., 'Last 3 months', 'Jan 1 - Mar 31, 2026')"
+                    compare_text = "periods"
+                
+                st.markdown(f"""
                 **Summary Table Columns:**
-                - **Quarter**: Q1, Q2, Q3, Q4 of the selected year
-                - **Count**: Number of completed issues per quarter
-                - **Total Story Points**: Sum of story points delivered per quarter
+                - {period_explanation}
+                - **Count**: Number of completed issues per {explanation_text}
+                - **Total Story Points**: Sum of story points delivered per {explanation_text}
                 - **Avg Cycle Time**: Average days from 'In Progress' to 'Done'
                 - **Median Cycle Time**: 50th percentile cycle time
                 - **P75 Cycle Time**: 75th percentile cycle time
                 - **P90 Cycle Time**: 90th percentile cycle time
                 
                 **How to Read This Table:**
-                - Compare **Count** and **Story Points** across quarters to see throughput trends
+                - Compare **Count** and **Story Points** across {compare_text} to see throughput trends
                 - Compare **cycle time metrics** to see delivery speed trends
                 - Use **P75/P90** values for realistic sprint planning and commitments
                 - Look for patterns: Are we getting faster? More productive? More consistent?
                 """)
     
-    # Create tabs for each quarter
-    if quarters_data:
-        tab1, tab2, tab3, tab4 = st.tabs(["Q1", "Q2", "Q3", "Q4"])
+    # Create tabs for periods
+    if periods_data:
+        if st.session_state.comparison_mode == "quarterly":
+            # Create tabs for quarters
+            tab1, tab2, tab3, tab4 = st.tabs(["Q1", "Q2", "Q3", "Q4"])
+            tabs_list = [tab1, tab2, tab3, tab4]
+            period_keys = [1, 2, 3, 4]
+        else:
+            # Create tabs for comparison periods
+            tab_labels = [periods_data[idx]['label'] for idx in sorted(periods_data.keys())]
+            tabs_list = st.tabs(tab_labels)
+            period_keys = sorted(periods_data.keys())
         
-        for quarter, tab in enumerate([tab1, tab2, tab3, tab4], 1):
+        for period_key, tab in zip(period_keys, tabs_list):
             with tab:
-                if quarter in quarters_data:
-                    data = quarters_data[quarter]
+                if period_key in periods_data:
+                    data = periods_data[period_key]
                     cycles = data['cycles']
                     issue_to_story_points = data['issue_to_story_points']
                     
@@ -492,8 +725,9 @@ if compute:
                         if isinstance(story_points, int):
                             story_points_list.append(story_points)
                     
+                    period_label = data.get('label', f"Period {period_key}")
                     if not seconds_list:
-                        st.info(f"Q{quarter}: No cycle time data available (missing status transitions).")
+                        st.info(f"{period_label}: No cycle time data available (missing status transitions).")
                     else:
                         summary = summarize_cycle_times(seconds_list)
                         total_story_points = sum(story_points_list) if story_points_list else 0
@@ -504,10 +738,11 @@ if compute:
                         # Create expandable sections for each metric
                         col1, col2, col3 = st.columns(3)
                         
+                        period_label = data.get('label', f"Period {period_key}")
                         with col1:
                             with st.expander("📊 Count", expanded=True):
                                 st.metric("Count", summary.get("count", 0))
-                                st.caption("Total number of issues that completed their cycle (moved from 'In Progress' to 'Done' status) during this quarter.")
+                                st.caption(f"Total number of issues that completed their cycle (moved from 'In Progress' to 'Done' status) during {period_label.lower()}.")
                         
                         with col2:
                             with st.expander("🎯 Story Points", expanded=True):
@@ -535,6 +770,128 @@ if compute:
                             with st.expander("🚀 P90", expanded=True):
                                 st.metric("P90 (days)", f"{(summary.get('p90_days') or 0):.2f}")
                                 st.caption("90th percentile - 90% of issues complete within this time. Useful for worst-case planning.")
+                        
+                        # Monthly ATP Breakdown
+                        st.divider()
+                        st.subheader("📅 Month-to-Month ATP Comparison")
+                        
+                        # Split period into months
+                        window = data['window']
+                        monthly_windows = split_period_into_months(window)
+                        
+                        if len(monthly_windows) > 1:
+                            # Process each month
+                            monthly_data = []
+                            
+                            for month_label, month_window in monthly_windows:
+                                # Filter cycles that were completed in this month
+                                month_cycles = [
+                                    c for c in valid_cycles
+                                    if c.done_at and month_window.start <= c.done_at <= month_window.end
+                                ]
+                                
+                                month_seconds = [c.seconds for c in month_cycles if c.seconds is not None]
+                                month_story_points = []
+                                for c in month_cycles:
+                                    sp = issue_to_story_points.get(c.issue_key, 0)
+                                    if isinstance(sp, int):
+                                        month_story_points.append(sp)
+                                
+                                # Calculate metrics (include months with 0 data for complete timeline)
+                                if month_seconds:
+                                    month_summary = summarize_cycle_times(month_seconds)
+                                    monthly_data.append({
+                                        'Month': month_label,
+                                        'Count': month_summary.get("count", 0),
+                                        'Story Points': sum(month_story_points) if month_story_points else 0,
+                                        'Avg Cycle Time (days)': round(month_summary.get('avg_days', 0), 2),
+                                        'Median Cycle Time (days)': round(month_summary.get('median_days', 0), 2),
+                                    })
+                                else:
+                                    # Include months with no data
+                                    monthly_data.append({
+                                        'Month': month_label,
+                                        'Count': 0,
+                                        'Story Points': 0,
+                                        'Avg Cycle Time (days)': 0.0,
+                                        'Median Cycle Time (days)': 0.0,
+                                    })
+                            
+                            if monthly_data:
+                                df_monthly = pd.DataFrame(monthly_data)
+                                
+                                # Create monthly comparison charts
+                                col_month1, col_month2 = st.columns(2)
+                                
+                                with col_month1:
+                                    fig_monthly_count = go.Figure()
+                                    fig_monthly_count.add_trace(go.Bar(
+                                        x=df_monthly['Month'],
+                                        y=df_monthly['Count'],
+                                        name='Issues Completed',
+                                        marker_color='lightblue'
+                                    ))
+                                    fig_monthly_count.add_trace(go.Bar(
+                                        x=df_monthly['Month'],
+                                        y=df_monthly['Story Points'],
+                                        name='Story Points',
+                                        marker_color='lightgreen'
+                                    ))
+                                    fig_monthly_count.update_layout(
+                                        title='Monthly Throughput (Issues & Story Points)',
+                                        xaxis_title='Month',
+                                        yaxis_title='Count / Story Points',
+                                        barmode='group',
+                                        height=400
+                                    )
+                                    st.plotly_chart(fig_monthly_count, use_container_width=True)
+                                
+                                with col_month2:
+                                    fig_monthly_cycle = go.Figure()
+                                    fig_monthly_cycle.add_trace(go.Bar(
+                                        x=df_monthly['Month'],
+                                        y=df_monthly['Avg Cycle Time (days)'],
+                                        name='Avg Cycle Time',
+                                        marker_color='orange'
+                                    ))
+                                    fig_monthly_cycle.add_trace(go.Bar(
+                                        x=df_monthly['Month'],
+                                        y=df_monthly['Median Cycle Time (days)'],
+                                        name='Median Cycle Time',
+                                        marker_color='red'
+                                    ))
+                                    fig_monthly_cycle.update_layout(
+                                        title='Monthly Cycle Time Metrics',
+                                        xaxis_title='Month',
+                                        yaxis_title='Days',
+                                        barmode='group',
+                                        height=400
+                                    )
+                                    st.plotly_chart(fig_monthly_cycle, use_container_width=True)
+                                
+                                # Monthly summary table
+                                st.subheader("📊 Monthly Summary")
+                                st.dataframe(df_monthly, use_container_width=True)
+                                
+                                with st.expander("📋 Monthly Breakdown Explanation", expanded=False):
+                                    st.markdown("""
+                                    **Monthly ATP Breakdown:**
+                                    - **Month**: Calendar month within the selected period
+                                    - **Count**: Number of issues completed in that month
+                                    - **Story Points**: Total story points delivered in that month
+                                    - **Avg Cycle Time**: Average cycle time for issues completed in that month
+                                    - **Median Cycle Time**: Median cycle time for issues completed in that month
+                                    
+                                    **How to Use This Data:**
+                                    - Track month-to-month trends in throughput and cycle time
+                                    - Identify seasonal patterns or performance changes
+                                    - Compare productivity across different months
+                                    - Use for capacity planning and goal setting
+                                    """)
+                            else:
+                                st.info("No monthly data available for this period.")
+                        else:
+                            st.info("Period spans less than one month. Monthly breakdown not available.")
                         
                         # Issue Type Breakdown Table
                         if valid_cycles:
@@ -688,8 +1045,9 @@ if compute:
                                         st.markdown(breakdown_html, unsafe_allow_html=True)
                         
                         # Debug table for filtered issues
+                        period_label = data.get('label', f"Period {period_key}")
                         if filtered_cycles:
-                            st.subheader(f"🔍 Q{quarter} Debug: Filtered Issues (N/A values)")
+                            st.subheader(f"🔍 {period_label} Debug: Filtered Issues (N/A values)")
                             debug_rows = []
                             for i, c in enumerate(filtered_cycles, 1):
                                 issue_url = f"{client.auth.base_url}/browse/{c.issue_key}"
@@ -727,10 +1085,15 @@ if compute:
                             
                             debug_html += "</table>"
                             st.markdown(debug_html, unsafe_allow_html=True)
-                            st.caption(f"Q{quarter}: These issues were excluded from cycle time calculations due to missing status transition data.")
+                            period_label = data.get('label', f"Period {period_key}")
+                            st.caption(f"{period_label}: These issues were excluded from cycle time calculations due to missing status transition data.")
                 else:
-                    st.info(f"Q{quarter}: No data available for this quarter.")
+                    period_label = periods_data[period_key].get('label', f"Period {period_key}") if period_key in periods_data else f"Period {period_key}"
+                    st.info(f"{period_label}: No data available for this period.")
     else:
-        st.info("No data available for any quarter.")
+        if st.session_state.comparison_mode == "quarterly":
+            st.info("No data available for any quarter.")
+        else:
+            st.info("No data available for any period.")
 
     st.caption("Throughput uses resolutiondate within the selected window; cycle time uses first transition to selected 'In Progress' → first transition to selected 'Done'.")

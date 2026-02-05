@@ -38,6 +38,109 @@ def _last_day_of_month(year: int, month: int) -> int:
     return last.day
 
 
+def compute_relative_period(months: int, tz: str = "UTC") -> TimeWindow:
+    """
+    Calculate time window for last N months from current date.
+    
+    Args:
+        months: Number of months to look back
+        tz: Timezone string (default: "UTC")
+        
+    Returns:
+        TimeWindow with start date N months ago and end date as current date/time
+    """
+    if months <= 0:
+        raise ValueError("Months must be positive")
+    timezone = pytz.timezone(tz)
+    now = timezone.localize(dt.datetime.now())
+    
+    # Calculate start date: N months ago
+    # Handle month boundaries properly by working with date objects
+    current_date = now.date()
+    
+    # Calculate target month and year
+    target_month = current_date.month - months
+    target_year = current_date.year
+    
+    # Adjust year if month goes negative
+    while target_month <= 0:
+        target_month += 12
+        target_year -= 1
+    
+    # Set start to beginning of that month
+    start = timezone.localize(dt.datetime(target_year, target_month, 1, 0, 0, 0))
+    
+    # End is current date/time
+    end = now
+    
+    return TimeWindow(start=start, end=end)
+
+
+def compute_custom_period(start_date: dt.date, end_date: dt.date, tz: str = "UTC") -> TimeWindow:
+    """
+    Create TimeWindow from custom start and end dates.
+    
+    Args:
+        start_date: Start date (inclusive)
+        end_date: End date (inclusive)
+        tz: Timezone string (default: "UTC")
+        
+    Returns:
+        TimeWindow with start at beginning of start_date and end at end of end_date
+    """
+    if end_date < start_date:
+        raise ValueError("End date must be after or equal to start date")
+    timezone = pytz.timezone(tz)
+    
+    # Start at beginning of start_date
+    start = timezone.localize(dt.datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0))
+    
+    # End at end of end_date (23:59:59.999999)
+    end = timezone.localize(dt.datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, 999999))
+    
+    return TimeWindow(start=start, end=end)
+
+
+def split_period_into_months(window: TimeWindow) -> List[Tuple[str, TimeWindow]]:
+    """
+    Split a TimeWindow into monthly chunks.
+    
+    Args:
+        window: TimeWindow to split
+        
+    Returns:
+        List of tuples (month_label, TimeWindow) for each month in the period
+    """
+    months = []
+    current = window.start
+    
+    while current <= window.end:
+        # Calculate end of current month
+        if current.month == 12:
+            next_month = current.replace(year=current.year + 1, month=1, day=1)
+        else:
+            next_month = current.replace(month=current.month + 1, day=1)
+        
+        # End of month is the last moment before next month starts
+        month_end = next_month - dt.timedelta(microseconds=1)
+        
+        # Don't go beyond the original window end
+        if month_end > window.end:
+            month_end = window.end
+        
+        # Create month label
+        month_label = current.strftime("%b %Y")
+        
+        # Create TimeWindow for this month
+        month_window = TimeWindow(start=current, end=month_end)
+        months.append((month_label, month_window))
+        
+        # Move to start of next month
+        current = next_month
+    
+    return months
+
+
 def jql_time_range_clause(field: str, window: TimeWindow) -> str:
     # Jira expects yyyy/MM/dd HH:mm
     fmt = "%Y/%m/%d %H:%M"
